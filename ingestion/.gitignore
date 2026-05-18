@@ -1,0 +1,44 @@
+.env
+*.pem
+*.key
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.Python
+
+# Raw data 
+raw/
+processed/
+*.ndjson
+*.parquet
+*.csv
+volume_log.csv
+
+# dbt
+dbt_project/target/
+dbt_project/dbt_packages/
+dbt_project/logs/
+dbt_project/.user.yml
+
+# Airflow
+airflow/logs/
+airflow/plugins/__pycache__/
+
+# R
+.Rhistory
+.RData
+.Rproj.user/
+*.Rproj
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
