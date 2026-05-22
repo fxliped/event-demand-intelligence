@@ -129,6 +129,7 @@ def fetch_data(start: str, end: str, stop_on_overflow: bool = False) -> tuple[li
         results = data.get("results", [])
         total = total or data.get("count", 0)
         
+        # overflow indicates there are more results than the subscription allows
         if data.get("overflow") and not overflowed:
             overflowed = True
             log.warning(
@@ -152,7 +153,16 @@ def fetch_data(start: str, end: str, stop_on_overflow: bool = False) -> tuple[li
 
 
 def _fetch_split(start: str, end: str) -> list[dict]:
-    """Walk day-by-day through an overflowed window, fetching each day exactly once."""
+    """
+    Walk day-by-day through an overflowed window, fetching each day exactly once.
+
+    Returns:
+        all_records: A list of events within the given overflowed timeframe
+    
+    Args: 
+        start: "YYYY-MM-DD"
+        end:   "YYYY-MM-DD"
+    """
     date_fmt = "%Y-%m-%d"
     cur = datetime.strptime(start, date_fmt)
     d_end = datetime.strptime(end, date_fmt)
@@ -172,10 +182,31 @@ def _fetch_split(start: str, end: str) -> list[dict]:
 
 
 def to_ndjson_bytes(records: list[dict]) -> bytes:
+    """
+    Convert records from list format to NDJSON, which is easily queryable in AWS
+
+    Returns:
+       The NDJSON formatte records encoded as bytes
+    
+    Args: 
+        records: A list of events
+    """
     return "\n".join(json.dumps(r) for r in records).encode("utf-8")
 
 
 def upload_to_s3(body: bytes, s3_key: str, skip_if_exists: bool = True) -> None:
+    """
+    Upload event records in the form of bytes to our s3 bucket
+
+    Returns:
+       None
+    
+    Args: 
+        body: The event records converted to byte format
+        s3_key: A string for the folder the data will live in
+        skip_if_exists: If the folder and record already exist, we skip over reuploading the bucket 
+    """
+
     s3_client = boto3.client("s3")
     if skip_if_exists:
         try:
@@ -196,9 +227,17 @@ def upload_to_s3(body: bytes, s3_key: str, skip_if_exists: bool = True) -> None:
 
 def retrieve_and_upload(start: str, end: str, upload: bool = True) -> int:
     """
-    Walk start -> end in CHUNK_DAYS windows.
-    Overflowed chunks are walked day-by-day.
-    Deduplicates by event id. Returns total unique record count.
+    Retrieve the events given the start and end dates.
+        Walk from start -> end in CHUNK_DAYS windows.
+        Overflowed chunks are walked day-by-day and events are deduplicated by event id. 
+    
+    Returns:
+        Count of total unique records
+    
+    Args:
+        start:  The beginning of the window in string format
+        end:    The end of the window in string format
+        upload: Whether or not to upload the retrieved events to AWS S3
     """
     date_fmt = "%Y-%m-%d"
     d_start  = datetime.strptime(start, date_fmt)
@@ -245,7 +284,7 @@ def retrieve_and_upload(start: str, end: str, upload: bool = True) -> int:
 
 
 if __name__ == "__main__":
-    start = (NOW - timedelta(days=60)).strftime("%Y-%m-%d")
+    start = (NOW - timedelta(days=31)).strftime("%Y-%m-%d")
     end   = DATE_END
 
     log.info(f"Starting ingest: {start} → {end}")
