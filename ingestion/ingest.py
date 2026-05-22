@@ -2,20 +2,22 @@ import requests
 import boto3
 import json
 import os
-import io
 import time
 import logging
-import csv
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 from dotenv import load_dotenv
+from botocore.exceptions import ClientError
 
 
 load_dotenv()
 
 # --- Credentials ---
 ACCESS_TOKEN = os.environ.get("PREDICTHQ_TOKEN")
-S3_BUCKET = os.environ.get("S3_BUCKET")
+S3_BUCKET    = os.environ.get("S3_BUCKET")
+
+missing = [k for k, v in {"PREDICTHQ_TOKEN": ACCESS_TOKEN, "S3_BUCKET": S3_BUCKET}.items() if not v]
+if missing:
+    raise RuntimeError(f"Missing required environment variables: {', '.join(missing)}")
 
 # --- Tunable Configurations ---
 PAGE_SIZE = 500
@@ -23,13 +25,9 @@ CHUNK_DAYS = 30
 REQUEST_SLEEP = 0.3
 RETRY_ATTEMPTS = 3
 
-VOLUME_LOG = "volume_log.csv"
-
 # --- Date Range ---
-NOW = datetime.now(timezone.utc) 
-DATE_END = (NOW - timedelta(days = 1)).strftime("%Y-%m-%dT%H:%M:%SZ")
-DATE_START = (datetime.now(timezone.utc) - timedelta(days=730)).strftime("%Y-%m-%dT%H:%M:%SZ")
-WEEK_AGO = (datetime.now(timezone.utc) - timedelta(days=7)).strftime("%Y-%m-%dT%H:%M:%SZ")
+NOW = datetime.now(timezone.utc)
+DATE_END   = (NOW - timedelta(days=1)).strftime("%Y-%m-%d")
 
 # --- Logging ---
 logging.basicConfig(
@@ -46,12 +44,6 @@ SESSION.headers.update({
     "Accept": "application/json",
 })
 
-# Functions:
-    # fetch_chunk() -> one date chunk from the data, handles pagination
-    # fetch_date_range() -> calls fetch_chunk() for each XX(90?)-day chunks from the 2 years, dedupes by id
-    # to_ndjson_bytes() -> turns dfs into NDJSON
-    # upload_to_s3() -> uploads bytes to S3 at partitioned path
-    # log_volume() -> to see how many GBs (daily bytes) of data stored
 
 
 # HTTP GET Request
@@ -90,20 +82,18 @@ def _get(params: dict) -> dict:
 
             r.raise_for_status()
 
-        except requests.exceptions.ConnectionError as e:
+        except requests.exceptions.HTTPError:
+            raise
+        except requests.exceptions.RequestException as e:
             wait = 5 * (2 ** attempt)
-            log.warning(f"Connection error - sleeping {wait}s: {e}")
+            log.warning(f"Request error - sleeping {wait}s: {e}")
             time.sleep(wait)
         
     raise RuntimeError(f"All {RETRY_ATTEMPTS} attempts failed for params {params}")
 
 
 
-# test best chunk and date sizing that is not limited - how?
-# how to best check errors - which errors to check?
-# what exceptions are there?
-# why bool return in the tuple?
-def fetch_chunk(start: str, end: str) -> tuple[list[dict], bool]:
+def fetch_data(start: str, end: str, stop_on_overflow: bool = False) -> tuple[list[dict], bool]:
     """
     Fetch all events where start >= 'start' and start <= 'end'.
     Paginates until exhausted.
@@ -127,8 +117,8 @@ def fetch_chunk(start: str, end: str) -> tuple[list[dict], bool]:
 
     while True:
         params = {
-            "start.gte": start,     #TWO_YEARS_AGO,  # events that started within the last 2 years
-            "start.lte": end,         #YESTERDAY,        # events that have already ended (finished)
+            "start.gte": start,     
+            "start.lte": end,         
             #"state": "active",
             "sort": "-start",
             "limit": PAGE_SIZE,                # max page size per request
@@ -139,14 +129,15 @@ def fetch_chunk(start: str, end: str) -> tuple[list[dict], bool]:
         results = data.get("results", [])
         total = total or data.get("count", 0)
         
-        if data.get("overflow"):
+        if data.get("overflow") and not overflowed:
             overflowed = True
             log.warning(
                 f"  OVERFLOW on {start} -> {end} "
-                f"(count={total}) - will split chunk"
+                f"(count={total}) - hit subscription cap, collecting available records"
             )
-            break
-        
+            if stop_on_overflow:
+                break
+
         all_results.extend(results)
         offset += len(results)
 
@@ -159,65 +150,105 @@ def fetch_chunk(start: str, end: str) -> tuple[list[dict], bool]:
 
     return all_results, overflowed
 
-# def fetch_date_range():
-        # 90 day chunk size should keep under PredictHQ's 10,000 result cap,
-        # if not, then adjust to a smaller day chunk
+
+def _fetch_split(start: str, end: str) -> list[dict]:
+    """Walk day-by-day through an overflowed window, fetching each day exactly once."""
+    date_fmt = "%Y-%m-%d"
+    cur = datetime.strptime(start, date_fmt)
+    d_end = datetime.strptime(end, date_fmt)
+    all_records = []
+
+    while cur <= d_end:
+        day = cur.strftime(date_fmt)
+        records, capped = fetch_data(day, day)
+        if capped:
+            log.warning(f"  {day}: hit 5,000 cap — {len(records):,} records collected, some may be missing")
+        all_records.extend(records)
+        cur += timedelta(days=1)
+
+    return all_records
 
 
 
 
-# example S3 path: bronze/events/year=2024/month=01/day=15/events__20240115T120000Z.ndjson
-# def upload_to_s3(df, bucket_name, s3_key):
-#     """Upload a DataFrame as CSV directly to S3 without writing a local file."""
-#     import io
-#     buffer = io.BytesIO()
-#     df.to_csv(buffer, index=False)
-#     buffer.seek(0)
+def to_ndjson_bytes(records: list[dict]) -> bytes:
+    return "\n".join(json.dumps(r) for r in records).encode("utf-8")
 
-#     s3_client = boto3.client("s3")
-#     try:
-#         s3_client.put_object(
-#             Bucket=bucket_name, 
-#             Key=s3_key, 
-#             Body=buffer #json.dumps(df)
-#         ) 
-#         print(f"Uploaded {len(df)} rows to s3://{bucket_name}/{s3_key}")
-#     except Exception as e:
-#         print(f"S3 upload failed: {e}")
-#         raise
 
+def upload_to_s3(body: bytes, s3_key: str, skip_if_exists: bool = True) -> None:
+    s3_client = boto3.client("s3")
+    if skip_if_exists:
+        try:
+            s3_client.head_object(Bucket=S3_BUCKET, Key=s3_key)
+            log.info(f"Skipping {s3_key} — already exists")
+            return
+        except ClientError as e:
+            if e.response["Error"]["Code"] != "404":
+                log.error(f"S3 head_object failed for {s3_key}: {e}")
+                raise
+    try:
+        s3_client.put_object(Bucket=S3_BUCKET, Key=s3_key, Body=body)
+        log.info(f"Uploaded {len(body):,} bytes → s3://{S3_BUCKET}/{s3_key}")
+    except ClientError as e:
+        log.error(f"S3 upload failed for {s3_key}: {e.response['Error']['Code']} — {e}")
+        raise
+
+
+def retrieve_and_upload(start: str, end: str, upload: bool = True) -> int:
+    """
+    Walk start -> end in CHUNK_DAYS windows.
+    Overflowed chunks are walked day-by-day.
+    Deduplicates by event id. Returns total unique record count.
+    """
+    date_fmt = "%Y-%m-%d"
+    d_start  = datetime.strptime(start, date_fmt)
+    d_end    = datetime.strptime(end,   date_fmt)
+
+    seen_ids    = set()
+    total_count = 0
+    cur = d_start
+
+    while cur <= d_end:
+        chunk_end = min(cur + timedelta(days=CHUNK_DAYS - 1), d_end)
+        s = cur.strftime(date_fmt)
+        e = chunk_end.strftime(date_fmt)
+
+        records, overflowed = fetch_data(s, e, stop_on_overflow=True)
+
+        if overflowed:
+            records = _fetch_split(s, e)
+
+        if not records:
+            log.info(f"  No records for {s} -> {e}, skipping")
+            cur = chunk_end + timedelta(days=1)
+            continue
+
+        # Deduplicate across chunks
+        unique = [r for r in records if r["id"] not in seen_ids]
+        seen_ids.update(r["id"] for r in unique)
+        total_count += len(unique)
+
+        if upload:
+            by_day: dict[tuple, list] = {}
+            for event in unique:
+                ymd = (event["start"][:4], event["start"][5:7], event["start"][8:10])
+                by_day.setdefault(ymd, []).append(event)
+
+            for (year, month, day), group in by_day.items():
+                s3_key = f"bronze/events/year={year}/month={month}/day={day}/events_{year}-{month}-{day}.ndjson"
+                upload_to_s3(to_ndjson_bytes(group), s3_key)
+
+        cur = chunk_end + timedelta(days=1)
+
+    log.info(f"Total unique records: {total_count:,}")
+    return total_count
 
 
 if __name__ == "__main__":
-    test_start = "2026-01-01"
-    test_end   = "2026-01-21"
+    start = (NOW - timedelta(days=60)).strftime("%Y-%m-%d")
+    end   = DATE_END
 
-    log.info(f"Testing single chunk: {test_start} → {test_end}")
-    records, overflowed = fetch_chunk(test_start, test_end)
-
-        # What you want to verify:
-    print(f"\n── fetch_chunk results ───────────────────────")
-    print(f"  Records returned : {len(records)}")
-    print(f"  Overflowed       : {overflowed}")
-
-    if records:
-            # Verify the shape of one record
-        sample = records[0]
-        print(f"\n── First record keys ─────────────────────────")
-        print(f"  {list(sample.keys())}")
-    
-
-
-    # useless cols: description, scope, parent_event.parent_event_id
-    # want private to be false, state is not active?
-
-
-    # run_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    # s3_key = f"predicthq/events/{run_date}.csv"
-    # upload_to_s3(df, S3_BUCKET, s3_key)
-    
-    
-    
-
-
+    log.info(f"Starting ingest: {start} → {end}")
+    total = retrieve_and_upload(start, end, upload=True)
+    log.info(f"Done — {total:,} unique records uploaded to s3://{S3_BUCKET}/bronze/events/")
 
