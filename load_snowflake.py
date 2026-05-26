@@ -3,23 +3,24 @@ import logging
 import snowflake.connector
 from pathlib import Path
 from dotenv import load_dotenv
+from cryptography.hazmat.primitives import serialization
 
 env_path = Path(__file__).resolve().parent / 'ingestion' / '.env'
 load_dotenv(dotenv_path=env_path)
 
 # --- Credentials ---
 SF_USER      = os.environ.get("SNOWFLAKE_USER")
-SF_PASSWORD  = os.environ.get("SNOWFLAKE_PASSWORD")
 SF_ACCOUNT   = os.environ.get("SNOWFLAKE_ACCOUNT")
 SF_WAREHOUSE = os.environ.get("SNOWFLAKE_WAREHOUSE")
 SF_DATABASE  = os.environ.get("SNOWFLAKE_DATABASE")
 SF_SCHEMA    = os.environ.get("SNOWFLAKE_SCHEMA")
+SF_KEY_PATH  = os.environ.get("SNOWFLAKE_PRIVATE_KEY_PATH")
 S3_BUCKET    = os.environ.get("S3_BUCKET")
 AWS_KEY      = os.environ.get("AWS_ACCESS_KEY_ID")
 AWS_SECRET   = os.environ.get("AWS_SECRET_ACCESS_KEY")
 
 missing = [k for k, v in {
-    "SNOWFLAKE_USER": SF_USER, "SNOWFLAKE_PASSWORD": SF_PASSWORD,
+    "SNOWFLAKE_USER": SF_USER, "SNOWFLAKE_PRIVATE_KEY_PATH": SF_KEY_PATH,
     "SNOWFLAKE_ACCOUNT": SF_ACCOUNT, "S3_BUCKET": S3_BUCKET,
     "AWS_ACCESS_KEY_ID": AWS_KEY, "AWS_SECRET_ACCESS_KEY": AWS_SECRET }.items() if not v]
 if missing:
@@ -35,17 +36,25 @@ log = logging.getLogger("sf_load")
 
 
 def _connect() -> snowflake.connector.SnowflakeConnection:
-    con = snowflake.connector.connect(
-        user          = SF_USER,
-        password      = SF_PASSWORD,
-        account       = SF_ACCOUNT,
-        warehouse     = SF_WAREHOUSE,
-        database      = SF_DATABASE,
-        schema        = SF_SCHEMA,
-        role          = 'SYSADMIN',
+    assert SF_KEY_PATH is not None
+    with open(SF_KEY_PATH, "rb") as f:
+        private_key = serialization.load_pem_private_key(
+            f.read(), password=None
+        )
+    private_key_bytes = private_key.private_bytes(
+        encoding=serialization.Encoding.DER,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption(),
     )
-    return con
-    
+    return snowflake.connector.connect(
+        user        = SF_USER,
+        private_key = private_key_bytes,
+        account     = SF_ACCOUNT,
+        warehouse   = SF_WAREHOUSE,
+        database    = SF_DATABASE,
+        schema      = SF_SCHEMA,
+        role        = 'SYSADMIN',
+    )
 
 
 def setup(cur) -> None:

@@ -41,7 +41,7 @@ renamed as (
         )                                                   as _row_num
     from source
     where raw:id is not null
-      and raw:private::boolean = false
+      and raw:private::boolean IS NOT TRUE
 )
 
 select * exclude (_row_num)

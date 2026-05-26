@@ -1,0 +1,13 @@
+predicthq_dbt:
+  target: dev
+  outputs:
+    dev:
+      type: snowflake
+      account: YOB85028
+      user: duenasfd
+      private_key_path: /opt/airflow/keys/rsa_key.p8
+      role: SYSADMIN
+      warehouse: predicthq_wh
+      database: predicthq_db
+      schema: staging
+      threads: 4

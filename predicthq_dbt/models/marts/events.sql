@@ -20,4 +20,3 @@ daily_agg as (
 )
 
 select * from daily_agg
-order by event_date, country, category
