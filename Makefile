@@ -1,0 +1,16 @@
+DBT = cd predicthq_dbt && set -a && source ../ingestion/.env && set +a && ../dbt-venv/bin/dbt
+
+dbt-run:
+	$(DBT) run
+
+dbt-test:
+	$(DBT) test
+
+dbt-all:
+	$(DBT) run && ../dbt-venv/bin/dbt test
+
+ingest:
+	cd ingestion && set -a && source .env && set +a && ../.venv/bin/python ingest.py
+
+load:
+	set -a && source ingestion/.env && set +a && .venv/bin/python load_snowflake.py

@@ -1,0 +1,18 @@
+version: 2
+
+models:
+  - name: events
+    description: "Daily event counts and attendance aggregated by country and category. Primary mart for Bayesian analysis."
+    columns:
+      - name: event_date
+        tests:
+          - not_null
+      - name: country
+        tests:
+          - not_null
+      - name: category
+        tests:
+          - not_null
+      - name: event_count
+        tests:
+          - not_null

@@ -1,0 +1,16 @@
+version: 2
+
+sources:
+  - name: raw
+    database: predicthq_db
+    schema: raw
+    tables:
+      - name: events_raw
+        description: "Raw NDJSON events loaded from S3 via COPY INTO."
+        columns:
+          - name: raw
+            description: "Full event JSON as Snowflake VARIANT."
+          - name: file_name
+            description: "S3 file path the row was loaded from."
+          - name: loaded_at
+            description: "Timestamp when the row was inserted."

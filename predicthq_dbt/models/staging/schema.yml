@@ -1,0 +1,20 @@
+version: 2
+
+models:
+  - name: stg_events
+    description: "Flattened and typed events from the raw VARIANT table."
+    columns:
+      - name: event_id
+        description: "PredictHQ unique event identifier."
+        tests:
+          - not_null
+          - unique
+      - name: category
+        tests:
+          - not_null
+      - name: event_start
+        tests:
+          - not_null
+      - name: country
+        tests:
+          - not_null

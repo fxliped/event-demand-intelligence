@@ -1,0 +1,20 @@
+# Python envs
+.venv/
+venv/
+dbt-venv/
+__pycache__/
+*.pyc
+
+# dbt
+predicthq_dbt/target/
+predicthq_dbt/dbt_packages/
+predicthq_dbt/logs/
+logs/
+
+# Secrets
+ingestion/.env
+.env
+keys/
+
+# macOS
+.DS_Store
