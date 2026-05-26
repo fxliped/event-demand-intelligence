@@ -14,3 +14,15 @@ ingest:
 
 load:
 	set -a && source ingestion/.env && set +a && .venv/bin/python load_snowflake.py
+
+airflow-up:
+	set -a && source ingestion/.env && set +a && docker compose up -d
+
+airflow-down:
+	docker compose down
+
+airflow-logs:
+	docker compose logs -f airflow
+
+airflow-password:
+	docker compose logs airflow 2>/dev/null | grep "Password for user" || true
