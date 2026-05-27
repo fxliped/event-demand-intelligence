@@ -16,5 +16,16 @@ ingestion/.env
 .env
 keys/
 
+# Analysis outputs (data files stay local)
+analysis/*.csv
+analysis/*.rds
+analysis/*.rdata
+
+# IDE
+.vscode/
+
+# dbt user config
+predicthq_dbt/.user.yml
+
 # macOS
 .DS_Store

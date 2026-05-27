@@ -5,7 +5,7 @@ predicthq_dbt:
       type: snowflake
       account: YOB85028
       user: duenasfd
-      private_key_path: /opt/airflow/keys/rsa_key.p8
+      private_key_path: "{{ env_var('SNOWFLAKE_PRIVATE_KEY_PATH') }}"
       role: SYSADMIN
       warehouse: predicthq_wh
       database: predicthq_db

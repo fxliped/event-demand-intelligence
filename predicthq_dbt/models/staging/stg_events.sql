@@ -10,6 +10,7 @@ renamed as (
     select
         raw:id::string                                      as event_id,
         raw:title::string                                   as title,
+        raw:description::string                             as description,
         raw:category::string                                as category,
         raw:phq_labels::array                               as phq_labels,
         raw:state::string                                   as event_state,
@@ -41,7 +42,7 @@ renamed as (
         )                                                   as _row_num
     from source
     where raw:id is not null
-      and raw:private::boolean IS NOT TRUE
+      and COALESCE(raw:private::boolean, FALSE) = FALSE
 )
 
 select * exclude (_row_num)

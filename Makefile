@@ -26,3 +26,6 @@ airflow-logs:
 
 airflow-password:
 	docker compose logs airflow 2>/dev/null | grep "Password for user" || true
+
+export:
+	set -a && source ingestion/.env && set +a && .venv/bin/python export_snapshot.py
