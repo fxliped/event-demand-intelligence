@@ -25,69 +25,100 @@ logging.basicConfig(
 log = logging.getLogger("export")
 
 QUERY = """
-WITH labels_agg AS (
+WITH deduped AS (
+    SELECT raw
+    FROM PREDICTHQ_DB.RAW.EVENTS_RAW
+    WHERE raw:id IS NOT NULL
+      AND COALESCE(raw:private::boolean, FALSE) = FALSE
+    QUALIFY ROW_NUMBER() OVER (
+        PARTITION BY raw:id::string
+        ORDER BY loaded_at DESC
+    ) = 1
+),
+
+day_counts AS (
     SELECT
-        e.event_id,
-        -- primary label = highest-weight industry tag; null if event has no labels
-        ARRAY_AGG(f.value:label::string)
-            WITHIN GROUP (ORDER BY f.value:weight::float DESC)[0]::string  AS primary_label,
-        COUNT(f.value)                                                      AS label_count
-    FROM predicthq_db.staging.stg_events e,
-    LATERAL FLATTEN(input => e.phq_labels, outer => true) f
-    WHERE e.country     = 'US'
-      AND e.event_start IS NOT NULL
-      AND e.phq_rank    IS NOT NULL
-    GROUP BY e.event_id
+        (raw:start_local::timestamp_ntz)::date AS day,
+        COUNT(*)                               AS event_count
+    FROM deduped
+    WHERE raw:country::string = 'US'
+    GROUP BY 1
+    HAVING COUNT(*) > 100
+),
+
+active_days AS (
+    SELECT day
+    FROM (
+        SELECT
+            day,
+            LAG(day)  OVER (ORDER BY day) AS prev_day,
+            LEAD(day) OVER (ORDER BY day) AS next_day
+        FROM day_counts
+    )
+    WHERE day - prev_day = 1
+       OR next_day - day = 1
+),
+labels_agg AS (
+    SELECT 
+    raw:id::string AS event_id,
+    ARRAY_AGG(f.value:label::string)
+        WITHIN GROUP (ORDER BY f.value:weight::float DESC)[0]::string AS primary_label, 
+    COUNT(f.value) AS label_count
+    FROM deduped, 
+    LATERAL FLATTEN(input => raw:phq_labels::array, outer => true) f
+    WHERE raw:country::string = 'US'
+    GROUP BY raw:id::string
+    ORDER BY label_count DESC
 )
+SELECT 
+    raw:id::string AS unique_id,
+    raw:title::string AS event_title,
+    raw:category::string AS category,
+    COALESCE(
+        REGEXP_SUBSTR(raw:description, '\\.com - (.*)$', 1, 1, 'e'), 
+        raw:description) AS description,
 
-SELECT
-    -- identifiers
-    e.event_id,
-    e.title,
-    e.category,
+    raw:start_local::timestamp_ntz AS start_local,
+    raw:end_local::timestamp_ntz AS end_local,
+    (raw:start_local::timestamp_ntz)::date AS event_date,
+    DAYOFWEEK(raw:start_local::timestamp_ntz) AS day_of_week,
+    HOUR(raw:start_local::timestamp_ntz) AS start_hour,
+    raw:timezone::string AS timezone,
+    
+    raw:geo:address:locality::string AS locality,
+    raw:geo:address:region::string AS state,
+    raw:geo:address:postcode::string AS postal_code,
+    raw:geo:address:formatted_address::string AS address,
+    CASE WHEN raw:geo:geometry:type::string = 'Point'
+         THEN raw:geo:geometry:coordinates[1]::float END AS latitude,
+    CASE WHEN raw:geo:geometry:type::string = 'Point'
+         THEN raw:geo:geometry:coordinates[0]::float END AS longitude,
 
-    -- time (temporal structure for model)
-    e.event_start,
-    e.event_end,
-    e.event_start::date                                              AS event_date,
-    YEAR(e.event_start)                                              AS event_year,
-    MONTH(e.event_start)                                             AS event_month,
-    DAYOFWEEK(e.event_start)                                         AS day_of_week,
-    CASE
-        WHEN MONTH(e.event_start) IN (12, 1, 2) THEN 'Winter'
-        WHEN MONTH(e.event_start) IN (3, 4, 5)  THEN 'Spring'
-        WHEN MONTH(e.event_start) IN (6, 7, 8)  THEN 'Summer'
-        ELSE                                          'Fall'
-    END                                                              AS season,
+    GET(raw:entities, ARRAY_SIZE(raw:entities) - 1):name::string AS venue_name,
+    
+    raw:phq_attendance::int AS attendance,
+    raw:local_rank::int AS local_rank,
+    raw:rank::int AS national_rank,
+    raw:local_rank::int - raw:rank::int AS local_lift,
 
-    -- geography (random effects: region; city for maps)
-    e.city,
-    e.region,
-    e.latitude,
-    e.longitude,
+    raw:duration::int AS duration,
+    DATEDIFF('day', raw:first_seen::timestamp_tz, raw:start_local::timestamp_ntz) AS days_advance,
 
-    -- demand outcomes
-    e.phq_rank,         -- primary outcome: 0-100, always present
-    e.local_rank,       -- local demand rank
-    e.aviation_rank,    -- travel/airport demand impact
-    e.phq_attendance,   -- secondary outcome: count, 86% non-null
-
-    -- event characteristics (fixed-effect predictors)
-    e.scope,            -- locality / region / national / international
-    e.duration_hours,
-    e.brand_safe,
-    DATEDIFF('day', e.first_seen::date, e.event_start::date)         AS days_advance,
-
-    -- industry labels (collapsed to one row per event)
-    la.primary_label,   -- highest-weight industry tag
-    la.label_count      -- number of industry tags (0 = uncategorized)
-
-FROM predicthq_db.staging.stg_events e
-LEFT JOIN labels_agg la ON la.event_id = e.event_id
-WHERE e.country     = 'US'
-  AND e.event_start IS NOT NULL
-  AND e.phq_rank    IS NOT NULL
-ORDER BY e.event_start
+    raw:phq_labels AS event_labels,
+    la.primary_label,
+    la.label_count
+    
+FROM deduped
+JOIN active_days 
+    ON (raw:start_local::timestamp_ntz)::date = active_days.day
+LEFT JOIN labels_agg la
+    ON la.event_id = raw:id::string
+WHERE raw:country = 'US' 
+        AND raw:category::string NOT IN ('severe-weather',
+            'disasters', 'airport-delays',
+            'daylight-savings', 'health-warnings',
+            'terror')
+ORDER BY raw:start_local::timestamp_ntz DESC
 """
 
 
@@ -118,20 +149,22 @@ if __name__ == "__main__":
         log.info("Running export query...")
         df = pd.read_sql(QUERY, conn)
         df.columns = df.columns.str.lower()
-        log.info(f"Fetched {len(df):,} rows across {df['event_id'].nunique():,} unique events")
+        log.info(f"Fetched {len(df):,} rows across {df['unique_id'].nunique():,} unique events")
 
         OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
         df.to_csv(OUTPUT_PATH, index=False)
         log.info(f"Saved → {OUTPUT_PATH}")
 
         log.info("\n--- Preview ---")
-        log.info(f"Rows (1 per event) : {len(df):,}")
-        log.info(f"Date range         : {df['event_date'].min()} → {df['event_date'].max()}")
-        log.info(f"Categories         : {sorted(df['category'].dropna().unique().tolist())}")
-        log.info(f"Regions            : {df['region'].nunique()} unique")
-        log.info(f"Cities             : {df['city'].nunique()} unique")
-        log.info(f"Primary labels     : {sorted(df['primary_label'].dropna().unique().tolist())}")
-        log.info(f"PHQ rank           : min={df['phq_rank'].min():.0f}  mean={df['phq_rank'].mean():.1f}  max={df['phq_rank'].max():.0f}")
-        log.info(f"Attendance         : {df['phq_attendance'].notna().sum():,} non-null  ({df['phq_attendance'].notna().mean()*100:.1f}%)")
+        log.info(f"Rows (1 per event)  : {len(df):,}")
+        log.info(f"Date range          : {df['event_date'].min()} → {df['event_date'].max()}")
+        log.info(f"Categories          : {sorted(df['category'].dropna().unique().tolist())}")
+        log.info(f"States              : {df['state'].nunique()} unique")
+        log.info(f"Cities              : {df['locality'].nunique()} unique")
+        log.info(f"Primary labels      : {sorted(df['primary_label'].dropna().unique().tolist())}")
+        log.info(f"Local rank          : min={df['local_rank'].min():.0f}  mean={df['local_rank'].mean():.1f}  max={df['local_rank'].max():.0f}")
+        log.info(f"National rank       : min={df['national_rank'].min():.0f}  mean={df['national_rank'].mean():.1f}  max={df['national_rank'].max():.0f}")
+        log.info(f"Local lift (gap)    : mean={df['local_lift'].mean():.1f}  std={df['local_lift'].std():.1f}")
+        log.info(f"Attendance          : {df['attendance'].notna().sum():,} non-null  ({df['attendance'].notna().mean()*100:.1f}%)")
     finally:
         conn.close()
