@@ -5,6 +5,7 @@
 # Question: What structural factors predict attendance at US public events, and what do posterior estimates reveal about the social vibrancy of US localities?
 # Model: Hierarchical Negative Binomial with random intercepts for event category and US state
 
+
 # ---- 0. Libraries ----
 library(tidyverse)
 library(lubridate)
@@ -69,6 +70,7 @@ df <- df %>%
     primary_label = label_info$primary
   )
 
+
 # --- 2. Missingness Analysis ---
 
 miss_tbl <- df %>% summarise(
@@ -87,8 +89,6 @@ miss_compare <- df %>%
     mean_natl = mean(national_rank, na.rm = TRUE),
     .groups = "drop")
 print(miss_compare)
-
-
 
 # --- 3. Modeling Sample ---
 state_abbr_map <- c(
@@ -130,7 +130,13 @@ events <- df %>%
 cat("Modeling sample:", nrow(events), "events\n")
 cat("state levels:", nlevels(events$state), "\n")
 
-
+# State-stratified 40% subsample for tractable sampling  (-> 29,288)
+set.seed(42)
+events_fit <- events %>%
+  group_by(state) %>% slice_sample(prop = 0.4) %>% ungroup() %>%
+  as.data.frame() %>%
+  mutate(category = droplevels(category), state = droplevels(state))
+cat("Fitting subsample:", nrow(events_fit), "events\n")
 
 # --- 4. Visual Summaries ---
 
@@ -163,8 +169,6 @@ ggsave("fig4_attendance_dow.png",
     labs(title = "Attendance by Day of Week", x = NULL, y = "Attendance (log scale)"),
   width = 7, height = 4, dpi = 150)
 
-
-
 # --- 5. Numerical Summaries ---
 
 summary_by_cat <- events %>% 
@@ -186,3 +190,131 @@ od <- events %>%
             ratio = var(attendance) / mean(attendance)
             )
 print(od)
+
+# --- 6. Poisson Baseline ---
+
+m_pois <- stan_glm(
+  attendance ~ category + is_weekend + log_duration + start_hour_z,
+  data = events, 
+  family = poisson(link = "log"),
+  prior_intercept = normal(0, 5, autoscale = TRUE),
+  prior = normal(0, 2.5, autoscale = TRUE),
+  QR = TRUE,
+  chains = 2, iter = 2000, seed = 42, refresh = 200
+)
+
+# --- 7. Hierarchical Negative Binomial
+
+m_nb <- stan_glmer(
+  attendance ~ is_weekend + start_hour_z + log_duration + label_count_z +
+               (1 | category) + (1 | state),
+  data = events,
+  family = neg_binomial_2(link = "log"),
+  prior_intercept = normal(0, 2.5, autoscale = TRUE),
+  prior = normal(0, 2.5, autoscale = TRUE),
+  prior_aux = rstanarm::exponential(1),
+  chains = 4, iter = 1500, warmup = 750,
+  seed = 42, adapt_delta = 0.9, refresh = 100
+)
+
+saveRDS(m_nb, "m_nb_final.rds")  
+prior_summary(m_nb)
+print(summary(m_nb))
+rhats <- summary(m_nb)[, "Rhat"]
+cat("Max R-hat:", round(max(rhats, na.rm = TRUE), 4), "\n")
+
+
+# --- 8. Diagnostics ---
+
+png("fig5_traceplots.png", width = 1100, height = 650, res = 130)
+plot(m_nb, plotfun = "trace",
+     pars = c("(Intercept)", "is_weekendTRUE", 
+              "log_duration", "start_hour_z"))
+dev.off()
+
+
+
+png("fig6_ppcheck.png", width = 1000, height = 550, res = 130)
+pp_check(m_nb) + 
+  scale_x_log10(labels = comma) + 
+  ggtitle("Posterior Predictive Check")
+dev.off()
+
+png("fig6b_ppc_poisson.png", width = 1000, height = 550, res = 130)
+pp_check(m_pois) + 
+  scale_x_log10(labels = comma) + 
+  ggtitle("Poisson baseline - note tail misfit")
+dev.off()
+
+
+# --- 9. Model Comparison ---
+loo_pois <- loo(m_pois)
+loo_nb   <- loo(m_nb)
+print(loo_compare(loo_pois, loo_nb))
+
+# --- 10. Posterior Interpretation ---
+fixef_tab <- cbind(
+  median = round(fixef(m_nb), 3),
+  round(posterior_interval(m_nb, prob = 0.90, pars = names(fixef(m_nb))), 3)
+)
+print(fixef_tab)
+
+
+png("fig7_coefficients.png", width = 1000, height = 550, res = 130)
+plot(m_nb, "areas", prob = 0.90, prob_outer = 1,
+     pars = c("is_weekendTRUE", "start_hour_z", "log_duration", "label_count_z")) + 
+  ggtitle("Posterior Distributions of Fixed Effects")
+dev.off()
+
+
+draws <- as.data.frame(m_nb)
+
+# Category random effects
+cat_cols <- grep("^b\\[\\(Intercept\\) category:", names(draws))
+cat_re <- data.frame(
+  category = gsub("b\\[\\(Intercept\\) category:(.*)\\]", "\\1", names(draws)[cat_cols]),
+  effect = apply(draws[, cat_cols, drop=FALSE], 2, median)
+) %>% arrange(desc(effect))
+print(cat_re)
+
+# State random effects
+state_cols <- grep("^b\\[\\(Intercept\\) state:", names(draws))
+state_re <- data.frame(
+  state = gsub("b\\[\\(Intercept\\) state:(.*)\\]", "\\1", names(draws)[state_cols]),
+  effect = apply(draws[, state_cols, drop=FALSE], 2, median)
+) %>% arrange(desc(effect))
+print(head(state_re, 15)); print(tail(state_re, 15))
+
+
+png("fig8_states.png", width = 1000, height = 800, res = 130)
+print(bind_rows(head(state_re,15), tail(state_re,15)) %>%
+  ggplot(aes(effect, reorder(state, effect))) +
+  geom_point(size = 2, color = "#2E75B6") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey50") +
+  labs(title = "State-Level Random Effects (Social Vibrancy)",
+       x = "Random intercept (log scale)", y = NULL))
+dev.off()
+
+
+# --- 11. Variance Partition & Variable Selection --- 
+vc <- as.data.frame(VarCorr(m_nb))
+print(vc)
+
+set.seed(42)
+ref_sample <- events %>% slice_sample(n = 15000) %>% as.data.frame() %>%
+  mutate(category = droplevels(category))
+m_ref <- stan_glm(
+  attendance ~ is_weekend + start_hour_z + log_duration + label_count_z + category,
+  data = ref_sample, family = neg_binomial_2(link = "log"),
+  prior = normal(0, 2.5, autoscale = TRUE), seed = 42, refresh = 0)
+vs <- cv_varsel(m_ref, method = "forward", cv_method = "kfold", K = 5)
+ 
+png("fig9_varsel.png", width = 1000, height = 550, res = 130)
+print(plot(vs, stats = "elpd", deltas = TRUE) +
+        ggtitle("Cross-Validated Variable Selection (ELPD)"))
+dev.off()
+print(suggest_size(vs)); print(ranking(vs))
+
+writeLines(capture.output(sessionInfo()), "session_info.txt")
+
+
